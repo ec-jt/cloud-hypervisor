@@ -28,10 +28,12 @@ use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdow
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;
 use crate::api::{
-    AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
-    VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi,
-    VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    AddDisk, ApiAction, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser,
+    VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete,
+    VmDirtyDelta, VmDirtyDeltaPacked, VmDirtyDeltaPackedKeyframe, VmDriveDirty, VmDriveDirtyData,
+    VmInitDeltaHashes, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -302,6 +304,23 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(&VmSnapshot)),
     );
+    // Dirty-delta tracking endpoints (incremental memory checkpoints).
+    r.routes.insert(
+        endpoint!("/memory/delta-hashes/init"),
+        Box::new(VmActionHandler::new(&VmInitDeltaHashes)),
+    );
+    r.routes.insert(
+        endpoint!("/memory/dirty-delta"),
+        Box::new(VmActionHandler::new(&VmDirtyDelta)),
+    );
+    r.routes.insert(
+        endpoint!("/memory/dirty-delta-packed"),
+        Box::new(VmActionHandler::new(&VmDirtyDeltaPacked)),
+    );
+    r.routes.insert(
+        endpoint!("/memory/dirty-delta-packed/keyframe"),
+        Box::new(VmActionHandler::new(&VmDirtyDeltaPackedKeyframe)),
+    );
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     r.routes.insert(
         endpoint!("/vm.coredump"),
@@ -317,6 +336,54 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r
 });
 
+/// Parse `/api/v1/drives/{id}/dirty[/reset]` paths. Returns the drive id
+/// and whether the bitmap should be reset.
+fn parse_drive_dirty_path(path: &str) -> Option<(String, bool)> {
+    let prefix = format!("{HTTP_ROOT}/drives/");
+    let rest = path.strip_prefix(&prefix)?;
+    let mut tokens = rest.split('/');
+    let id = tokens.next()?;
+    if id.is_empty() {
+        return None;
+    }
+    match (tokens.next(), tokens.next(), tokens.next()) {
+        (Some("dirty"), None, _) => Some((id.to_string(), false)),
+        (Some("dirty"), Some("reset"), None) => Some((id.to_string(), true)),
+        _ => None,
+    }
+}
+
+/// Handle `GET /api/v1/drives/{id}/dirty[/reset]` requests, which carry a
+/// path parameter and therefore can't be served by the exact-match route
+/// table.
+fn handle_drive_dirty_request(
+    request: &Request,
+    api_notifier: &EventFd,
+    api_sender: &Sender<ApiRequest>,
+    id: String,
+    reset: bool,
+) -> Response {
+    if request.method() != Method::Get {
+        return error_response(HttpError::BadRequest);
+    }
+    let notifier = match api_notifier.try_clone() {
+        Ok(notifier) => notifier,
+        Err(_) => return error_response(HttpError::InternalServerError),
+    };
+    match VmDriveDirty
+        .send(notifier, api_sender.clone(), VmDriveDirtyData { id, reset })
+        .map_err(HttpError::ApiError)
+    {
+        Ok(Some(body)) => {
+            let mut response = Response::new(Version::Http11, StatusCode::OK);
+            response.set_body(body);
+            response
+        }
+        Ok(None) => Response::new(Version::Http11, StatusCode::NoContent),
+        Err(e) => error_response(e),
+    }
+}
+
 fn handle_http_request(
     request: &Request,
     api_notifier: &EventFd,
@@ -328,7 +395,12 @@ fn handle_http_request(
             Ok(notifier) => route.handle_request(request, notifier, api_sender.clone()),
             Err(_) => error_response(HttpError::InternalServerError),
         },
-        None => error_response(HttpError::NotFound),
+        None => match parse_drive_dirty_path(&path) {
+            Some((id, reset)) => {
+                handle_drive_dirty_request(request, api_notifier, api_sender, id, reset)
+            }
+            None => error_response(HttpError::NotFound),
+        },
     };
 
     response.set_server("Cloud Hypervisor API");

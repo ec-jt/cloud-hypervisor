@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
-use vm_memory::GuestMemoryAtomic;
 use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
 use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
@@ -71,6 +71,7 @@ mod acpi;
 pub mod api;
 mod clone3;
 pub mod config;
+pub mod dirty_delta;
 pub mod console_devices;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 mod coredump;
@@ -621,6 +622,8 @@ pub struct VmmThreadHandle {
 
 pub struct Vmm {
     epoll: EpollContext,
+    delta_tracker: crate::dirty_delta::DeltaTracker,
+    dirty_log_started: bool,
     exit_evt: EventFd,
     reset_evt: EventFd,
     guest_exit_evt: EventFd,
@@ -838,6 +841,8 @@ impl Vmm {
 
         Ok(Vmm {
             epoll,
+            delta_tracker: crate::dirty_delta::DeltaTracker::default(),
+            dirty_log_started: false,
             exit_evt,
             reset_evt,
             guest_exit_evt,
@@ -2525,6 +2530,134 @@ impl RequestHandler for Vmm {
         } else {
             Err(VmError::VmNotRunning)
         }
+    }
+
+    fn vm_init_delta_hashes(&mut self, golden_mem_path: String) -> result::Result<(), VmError> {
+        let Some(ref vm) = self.vm else {
+            return Err(VmError::VmNotRunning);
+        };
+
+        self.delta_tracker
+            .init_delta_hashes(&golden_mem_path)
+            .map_err(VmError::DirtyDelta)?;
+
+        // Start hypervisor dirty page logging so that subsequent
+        // dirty-delta exports see all guest writes from this point on.
+        if !self.dirty_log_started {
+            vm.start_dirty_log()
+                .map_err(|e| VmError::DirtyDelta(format!("start_dirty_log: {e}")))?;
+            self.dirty_log_started = true;
+        }
+
+        Ok(())
+    }
+
+    fn vm_dirty_delta(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
+        let Some(ref vm) = self.vm else {
+            return Err(VmError::VmNotRunning);
+        };
+        if vm.get_state() != VmState::Paused {
+            return Err(VmError::DirtyDelta(
+                "operation not supported while VM is running - pause first".to_string(),
+            ));
+        }
+        if !self.dirty_log_started {
+            return Err(VmError::DirtyDelta(
+                "dirty log not started - call /memory/delta-hashes/init first".to_string(),
+            ));
+        }
+
+        let start = std::time::Instant::now();
+        let table = vm
+            .dirty_log()
+            .map_err(|e| VmError::DirtyDelta(format!("dirty_log: {e}")))?;
+        let guest_memory = vm.guest_memory();
+        let mem = guest_memory.memory();
+        let bitmap = self
+            .delta_tracker
+            .dirty_delta_bitmap(&table, &*mem)
+            .map_err(VmError::DirtyDelta)?;
+
+        let dirty_count: u64 = bitmap.iter().map(|w| u64::from(w.count_ones())).sum();
+        info!(
+            "vm_dirty_delta: {} truly-changed 4KB blocks in {}us",
+            dirty_count,
+            start.elapsed().as_micros()
+        );
+
+        serde_json::to_vec(&serde_json::json!({ "bitmap": bitmap }))
+            .map(Some)
+            .map_err(VmError::SerializeJson)
+    }
+
+    fn vm_dirty_delta_packed(&mut self, keyframe: bool) -> result::Result<Option<Vec<u8>>, VmError> {
+        let Some(ref vm) = self.vm else {
+            return Err(VmError::VmNotRunning);
+        };
+        if vm.get_state() != VmState::Paused {
+            return Err(VmError::DirtyDelta(
+                "operation not supported while VM is running - pause first".to_string(),
+            ));
+        }
+        if !self.dirty_log_started {
+            return Err(VmError::DirtyDelta(
+                "dirty log not started - call /memory/delta-hashes/init first".to_string(),
+            ));
+        }
+
+        if keyframe {
+            let cleared = self.delta_tracker.clear_prev_blocks();
+            info!(
+                "vm_dirty_delta_packed KEYFRAME: cleared {cleared} prev blocks - forcing I-frame"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let table = vm
+            .dirty_log()
+            .map_err(|e| VmError::DirtyDelta(format!("dirty_log: {e}")))?;
+        let guest_memory = vm.guest_memory();
+        let mem = guest_memory.memory();
+        let packed = self
+            .delta_tracker
+            .dirty_delta_packed(&table, &*mem)
+            .map_err(VmError::DirtyDelta)?;
+
+        info!(
+            "vm_dirty_delta_packed: {} blocks, {}B raw, {}B compressed, frame={} in {}us",
+            packed.block_count,
+            packed.raw_size,
+            packed.blob.len(),
+            if packed.is_p_frame { "P" } else { "I" },
+            start.elapsed().as_micros()
+        );
+
+        // Binary response: 9-byte envelope + lz4 blob.
+        // [block_count: u32 LE][raw_size: u32 LE][flags: u8][lz4 blob...]
+        // flags bit 0: 0=I-frame (XOR vs golden), 1=P-frame (XOR vs prev).
+        let flags: u8 = if packed.is_p_frame { 1 } else { 0 };
+        let mut body = Vec::with_capacity(9 + packed.blob.len());
+        body.extend_from_slice(&packed.block_count.to_le_bytes());
+        body.extend_from_slice(&(packed.raw_size as u32).to_le_bytes());
+        body.push(flags);
+        body.extend_from_slice(&packed.blob);
+
+        Ok(Some(body))
+    }
+
+    fn vm_drive_dirty(
+        &mut self,
+        id: String,
+        reset: bool,
+    ) -> result::Result<Option<Vec<u8>>, VmError> {
+        let Some(ref vm) = self.vm else {
+            return Err(VmError::VmNotRunning);
+        };
+
+        let response = vm.drive_dirty(&id, reset)?;
+        serde_json::to_vec(&response)
+            .map(Some)
+            .map_err(VmError::SerializeJson)
     }
 
     fn vm_receive_migration(

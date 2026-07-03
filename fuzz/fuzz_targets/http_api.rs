@@ -303,6 +303,22 @@ impl RequestHandler for StubApiRequestHandler {
     fn vm_nmi(&mut self) -> Result<(), VmError> {
         Ok(())
     }
+
+    fn vm_init_delta_hashes(&mut self, _: String) -> Result<(), VmError> {
+        Ok(())
+    }
+
+    fn vm_dirty_delta(&mut self) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(None)
+    }
+
+    fn vm_dirty_delta_packed(&mut self, _: bool) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(None)
+    }
+
+    fn vm_drive_dirty(&mut self, _: String, _: bool) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(None)
+    }
 }
 
 fn http_receiver_stub(exit_evt: EventFd, api_evt: EventFd, api_receiver: Receiver<ApiRequest>) {

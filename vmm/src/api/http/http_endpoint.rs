@@ -47,7 +47,8 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
+    VmConfig, VmCounters, VmDelete, VmDirtyDelta, VmDirtyDeltaPacked, VmDirtyDeltaPackedKeyframe,
+    VmInitDeltaHashes, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
     VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
     VmShutdown, VmSnapshot,
 };
@@ -407,6 +408,9 @@ macro_rules! vm_action_put_handler_body {
 }
 
 vm_action_get_handler!(VmCounters);
+vm_action_get_handler!(VmDirtyDelta);
+vm_action_get_handler!(VmDirtyDeltaPacked);
+vm_action_get_handler!(VmDirtyDeltaPackedKeyframe);
 
 vm_action_put_handler!(VmBoot);
 vm_action_put_handler!(VmDelete);
@@ -429,6 +433,7 @@ vm_action_put_handler_body!(VmRemoveDevice);
 vm_action_put_handler_body!(VmResizeDisk);
 vm_action_put_handler_body!(VmResizeZone);
 vm_action_put_handler_body!(VmSnapshot);
+vm_action_put_handler_body!(VmInitDeltaHashes);
 vm_action_put_handler_body!(VmReceiveMigration);
 vm_action_put_handler_body!(VmSendMigration);
 

@@ -103,6 +103,10 @@ pub enum ApiError {
     #[error("The VM could not resume")]
     VmResume(#[source] VmError),
 
+    /// A dirty-delta tracking operation failed.
+    #[error("Dirty delta tracking operation failed")]
+    VmDirtyDelta(#[source] VmError),
+
     /// The VM is not booted.
     #[error("The VM is not booted")]
     VmNotBooted,
@@ -247,6 +251,20 @@ pub struct VmResizeDiskData {
 pub struct VmResizeZoneData {
     pub id: String,
     pub desired_ram: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct VmInitDeltaHashesData {
+    /// Path to the golden memory snapshot file to hash and keep mmap'd.
+    pub golden_mem_path: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct VmDriveDirtyData {
+    /// Block device id.
+    pub id: String,
+    /// Whether to atomically reset the bitmap after reading it.
+    pub reset: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -585,6 +603,14 @@ pub trait RequestHandler {
     ) -> Result<(), MigratableError>;
 
     fn vm_nmi(&mut self) -> Result<(), VmError>;
+
+    fn vm_init_delta_hashes(&mut self, golden_mem_path: String) -> Result<(), VmError>;
+
+    fn vm_dirty_delta(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+
+    fn vm_dirty_delta_packed(&mut self, keyframe: bool) -> Result<Option<Vec<u8>>, VmError>;
+
+    fn vm_drive_dirty(&mut self, id: String, reset: bool) -> Result<Option<Vec<u8>>, VmError>;
 }
 
 /// It would be nice if we could pass around an object like this:
@@ -1719,6 +1745,179 @@ impl ApiAction for VmmShutdown {
         get_response(self, api_evt, api_sender, data)?;
 
         Ok(())
+    }
+}
+
+pub struct VmInitDeltaHashes;
+
+impl ApiAction for VmInitDeltaHashes {
+    type RequestBody = VmInitDeltaHashesData;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        data: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmInitDeltaHashes {data:?}");
+
+            let response = vmm
+                .vm_init_delta_hashes(data.golden_mem_path)
+                .map_err(ApiError::VmDirtyDelta)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDirtyDelta;
+
+impl ApiAction for VmDirtyDelta {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmDirtyDelta");
+
+            let response = vmm
+                .vm_dirty_delta()
+                .map_err(ApiError::VmDirtyDelta)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDirtyDeltaPacked;
+
+impl ApiAction for VmDirtyDeltaPacked {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmDirtyDeltaPacked");
+
+            let response = vmm
+                .vm_dirty_delta_packed(false)
+                .map_err(ApiError::VmDirtyDelta)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDirtyDeltaPackedKeyframe;
+
+impl ApiAction for VmDirtyDeltaPackedKeyframe {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmDirtyDeltaPackedKeyframe");
+
+            let response = vmm
+                .vm_dirty_delta_packed(true)
+                .map_err(ApiError::VmDirtyDelta)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDriveDirty;
+
+impl ApiAction for VmDriveDirty {
+    type RequestBody = VmDriveDirtyData;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        data: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmDriveDirty {data:?}");
+
+            let response = vmm
+                .vm_drive_dirty(data.id, data.reset)
+                .map_err(ApiError::VmDirtyDelta)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
     }
 }
 
