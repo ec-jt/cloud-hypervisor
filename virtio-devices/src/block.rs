@@ -149,6 +149,75 @@ impl Default for BlockCounters {
     }
 }
 
+/// Thread-safe dirty block bitmap for tracking writes to a block device.
+///
+/// Each bit represents one `block_size` block. Bits are set atomically on
+/// every guest write and cleared on reset. Used by the dirty-delta
+/// checkpoint export (`GET /drives/{id}/dirty[/reset]`).
+#[derive(Debug)]
+pub struct DiskDirtyBitmap {
+    bitmap: Vec<AtomicU64>,
+    block_size: u64,
+    total_blocks: u64,
+}
+
+impl DiskDirtyBitmap {
+    pub fn new(disk_size: u64, block_size: u64) -> Self {
+        let total_blocks = disk_size.div_ceil(block_size);
+        let num_words = total_blocks.div_ceil(64) as usize;
+        let bitmap: Vec<AtomicU64> = (0..num_words).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            bitmap,
+            block_size,
+            total_blocks,
+        }
+    }
+
+    /// Mark blocks as dirty for a write at the given byte offset and length.
+    pub fn track_write(&self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let start_block = offset / self.block_size;
+        let end_block = (offset + len - 1) / self.block_size;
+        for block in start_block..=end_block {
+            if block >= self.total_blocks {
+                break;
+            }
+            let word = (block / 64) as usize;
+            let bit = block % 64;
+            if word < self.bitmap.len() {
+                self.bitmap[word].fetch_or(1 << bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Get the dirty bitmap as a `Vec<u64>` plus dirty block count,
+    /// optionally resetting it atomically.
+    pub fn snapshot(&self, reset: bool) -> (Vec<u64>, u64) {
+        let mut result = Vec::with_capacity(self.bitmap.len());
+        let mut dirty_count = 0u64;
+        for word in &self.bitmap {
+            let val = if reset {
+                word.swap(0, Ordering::Relaxed)
+            } else {
+                word.load(Ordering::Relaxed)
+            };
+            dirty_count += u64::from(val.count_ones());
+            result.push(val);
+        }
+        (result, dirty_count)
+    }
+
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    pub fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+}
+
 struct BlockEpollHandler {
     queue_index: u16,
     queue: Queue,
@@ -168,6 +237,7 @@ struct BlockEpollHandler {
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
     disable_sector0_writes: bool,
+    dirty_bitmap: Option<Arc<DiskDirtyBitmap>>,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -302,6 +372,17 @@ impl BlockEpollHandler {
             }
 
             request.writeback = self.writeback.load(Ordering::Acquire);
+
+            // Track dirty blocks before submitting the write.
+            if request.request_type() == RequestType::Out
+                && let Some(ref dirty) = self.dirty_bitmap
+            {
+                let mut len = 0u64;
+                for (_, data_len) in request.data_descriptors() {
+                    len += u64::from(*data_len);
+                }
+                dirty.track_write(request.sector() * SECTOR_SIZE, len);
+            }
 
             let result = request.execute_async(
                 self.mem.memory().into_inner(),
@@ -724,6 +805,7 @@ pub struct Block {
     disable_sector0_writes: bool,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
+    dirty_bitmap: Option<Arc<DiskDirtyBitmap>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -862,6 +944,17 @@ impl Block {
             .map_or_else(|| build_serial(&disk_path), Vec::from)
             .into_boxed_slice();
 
+        // Dirty block tracking for writable disks (4KB granularity),
+        // used by the dirty-delta checkpoint export.
+        let dirty_bitmap = if !read_only && disk_nsectors > 0 {
+            Some(Arc::new(DiskDirtyBitmap::new(
+                disk_nsectors * SECTOR_SIZE,
+                4096,
+            )))
+        } else {
+            None
+        };
+
         Ok(Block {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Block as u32,
@@ -888,7 +981,13 @@ impl Block {
             disable_sector0_writes,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
+            dirty_bitmap,
         })
+    }
+
+    /// Dirty block bitmap for this disk (None for read-only disks).
+    pub fn dirty_bitmap(&self) -> Option<Arc<DiskDirtyBitmap>> {
+        self.dirty_bitmap.clone()
     }
 
     fn read_only(&self) -> bool {
@@ -1140,6 +1239,7 @@ impl VirtioDevice for Block {
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
                 disable_sector0_writes: self.disable_sector0_writes,
+                dirty_bitmap: self.dirty_bitmap.clone(),
             };
 
             let paused = self.common.paused.clone();
