@@ -174,6 +174,9 @@ pub enum Error {
     #[error("Error from device manager")]
     DeviceManager(#[source] DeviceManagerError),
 
+    #[error("Dirty delta tracking error: {0}")]
+    DirtyDelta(String),
+
     #[error("Error initializing VM")]
     InitializeVm(#[source] hypervisor::HypervisorVmError),
 
@@ -3062,6 +3065,29 @@ impl Vm {
             .lock()
             .unwrap()
             .memory_range_table(false)
+    }
+
+    /// Start hypervisor dirty page logging (used by dirty-delta tracking).
+    pub fn start_dirty_log(&self) -> std::result::Result<(), MigratableError> {
+        self.memory_manager.lock().unwrap().start_dirty_log()
+    }
+
+    /// Fetch (and reset) the hypervisor dirty page log as a range table.
+    pub fn dirty_log(&self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        self.memory_manager.lock().unwrap().dirty_log()
+    }
+
+    /// Get (and optionally reset) the dirty block bitmap for a disk.
+    pub fn drive_dirty(
+        &self,
+        device_id: &str,
+        reset: bool,
+    ) -> Result<crate::dirty_delta::DriveDirtyResponse> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .drive_dirty_bitmap(device_id, reset)
+            .map_err(Error::DeviceManager)
     }
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {

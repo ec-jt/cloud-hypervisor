@@ -5294,6 +5294,31 @@ impl DeviceManager {
         Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
     }
 
+    /// Get (and optionally reset) the dirty block bitmap for a disk.
+    pub fn drive_dirty_bitmap(
+        &self,
+        device_id: &str,
+        reset: bool,
+    ) -> DeviceManagerResult<crate::dirty_delta::DriveDirtyResponse> {
+        for dev in &self.block_devices {
+            let disk = dev.lock().unwrap();
+            if disk.id() == device_id {
+                return Ok(if let Some(dirty) = disk.dirty_bitmap() {
+                    let (bitmap, dirty_count) = dirty.snapshot(reset);
+                    crate::dirty_delta::DriveDirtyResponse {
+                        bitmap,
+                        block_size: dirty.block_size(),
+                        total_blocks: dirty.total_blocks(),
+                        dirty_count,
+                    }
+                } else {
+                    crate::dirty_delta::DriveDirtyResponse::default()
+                });
+            }
+        }
+        Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
+    }
+
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
         self.device_tree.clone()
     }
