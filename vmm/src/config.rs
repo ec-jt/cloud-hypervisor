@@ -380,6 +380,9 @@ pub enum ValidationError {
     /// Prefault cannot be combined with on-demand restore
     #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// External memory backend cannot be combined with prefault or on-demand restore
+    #[error("'memory_backend' cannot be combined with 'prefault' or 'memory_restore_mode=ondemand'")]
+    InvalidRestoreMemoryBackendCombination,
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
     LandlockPathDoesNotExist(PathBuf),
@@ -2728,6 +2731,29 @@ impl FromStr for MemoryRestoreMode {
     }
 }
 
+/// External memory backend type for snapshot restore.
+///
+/// `Uffd` delegates all guest memory page faults to an external handler
+/// process. Cloud Hypervisor creates the guest memory mappings, registers
+/// them with a userfaultfd, connects to the handler's unix socket, sends
+/// the memory layout as JSON, and passes the userfaultfd via SCM_RIGHTS.
+/// The wire protocol matches Firecracker's `mem_backend` UFFD handshake so
+/// the same external handler binary works with both VMMs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryBackendType {
+    Uffd,
+}
+
+/// External memory backend configuration for snapshot restore.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryBackendConfig {
+    #[serde(rename = "type")]
+    pub backend_type: MemoryBackendType,
+    /// Unix socket path where the external UFFD handler is listening.
+    pub socket: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoreConfig {
     pub source_url: PathBuf,
@@ -2739,6 +2765,9 @@ pub struct RestoreConfig {
     pub net_fds: Option<Vec<RestoredNetConfig>>,
     #[serde(default)]
     pub resume: bool,
+    /// Optional external memory backend (e.g. UFFD demand paging).
+    #[serde(default)]
+    pub memory_backend: Option<MemoryBackendConfig>,
 }
 
 impl RestoreConfig {
@@ -2750,7 +2779,9 @@ impl RestoreConfig {
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
-        \n `resume` controls whether the VM will be directly resumed after restore ";
+        \n `resume` controls whether the VM will be directly resumed after restore \
+        \n`memory_backend_socket` enables the external UFFD memory backend: guest memory is \
+        demand-paged by an external handler listening on the given unix socket ";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2759,7 +2790,8 @@ impl RestoreConfig {
             .add("prefault")
             .add("memory_restore_mode")
             .add("net_fds")
-            .add("resume");
+            .add("resume")
+            .add("memory_backend_socket");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -2792,6 +2824,13 @@ impl RestoreConfig {
             .map_err(Error::ParseRestore)?
             .unwrap_or(Toggle(false))
             .0;
+        let memory_backend =
+            parser
+                .get("memory_backend_socket")
+                .map(|socket| MemoryBackendConfig {
+                    backend_type: MemoryBackendType::Uffd,
+                    socket: PathBuf::from(socket),
+                });
 
         Ok(RestoreConfig {
             source_url,
@@ -2799,6 +2838,7 @@ impl RestoreConfig {
             memory_restore_mode,
             net_fds,
             resume,
+            memory_backend,
         })
     }
 
@@ -2808,6 +2848,12 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
+        }
+
+        if self.memory_backend.is_some()
+            && (self.prefault || self.memory_restore_mode == MemoryRestoreMode::OnDemand)
+        {
+            return Err(ValidationError::InvalidRestoreMemoryBackendCombination);
         }
 
         let mut restored_net_with_fds = HashMap::new();
@@ -4931,6 +4977,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
                 resume: false,
+                memory_backend: None,
             }
         );
         assert_eq!(
@@ -4954,6 +5001,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     }
                 ]),
                 resume: false,
+                memory_backend: None,
             }
         );
         assert_eq!(
@@ -4964,6 +5012,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
                 net_fds: None,
                 resume: false,
+                memory_backend: None,
             }
         );
         assert_eq!(
@@ -4974,6 +5023,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
                 resume: true,
+                memory_backend: None,
             }
         );
         // Parsing should fail as source_url is a required field
@@ -5086,6 +5136,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 },
             ]),
             resume: false,
+            memory_backend: None,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -5151,6 +5202,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: None,
             resume: false,
+            memory_backend: None,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             pci_common: PciDeviceCommonConfig {
@@ -5168,6 +5220,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_restore_mode: MemoryRestoreMode::OnDemand,
             net_fds: None,
             resume: false,
+            memory_backend: None,
         };
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),

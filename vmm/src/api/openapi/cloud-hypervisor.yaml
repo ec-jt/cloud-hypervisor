@@ -1492,6 +1492,21 @@ components:
           $ref: "#/components/schemas/MemoryRestoreMode"
         resume:
           type: boolean
+        memory_backend:
+          $ref: "#/components/schemas/MemoryBackendConfig"
+
+    MemoryBackendConfig:
+      required:
+        - type
+        - socket
+      type: object
+      properties:
+        type:
+          type: string
+          enum: ["uffd"]
+        socket:
+          type: string
+          description: Unix socket path of the external UFFD handler
 
     ReceiveMigrationData:
       required:
