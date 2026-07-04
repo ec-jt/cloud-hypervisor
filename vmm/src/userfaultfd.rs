@@ -26,6 +26,12 @@ const _: () = assert!(UFFDIO_REGISTER <= u32::MAX as u64);
 const _: () = assert!(UFFDIO_COPY <= u32::MAX as u64);
 const _: () = assert!(UFFDIO_WAKE <= u32::MAX as u64);
 
+// UFFDIO_WRITEPROTECT: _IOWR(0xAA, 0x06, struct uffdio_writeprotect) — 24 bytes
+pub const UFFDIO_WRITEPROTECT: u64 = 0xc018_aa06;
+const _: () = assert!(UFFDIO_WRITEPROTECT == ioctl_ioc(IOC_READWRITE, 0xAA, 0x06, 24));
+const _: () = assert!(UFFDIO_WRITEPROTECT <= u32::MAX as u64);
+pub const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
+
 // /dev/userfaultfd ioctl: _IO(0xAA, 0x00)
 pub const USERFAULTFD_IOC_NEW: u64 = 0x0000_AA00;
 const _: () = assert!(USERFAULTFD_IOC_NEW == ioctl_ioc(0, 0xAA, 0x00, 0));
@@ -33,9 +39,12 @@ const _: () = assert!(USERFAULTFD_IOC_NEW <= u32::MAX as u64);
 
 pub const UFFD_API: u64 = 0xAA;
 pub const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+pub const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
 pub const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
+pub const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
 pub const UFFD_FEATURE_MISSING_HUGETLBFS: u64 = 1 << 4;
 pub const UFFD_FEATURE_MISSING_SHMEM: u64 = 1 << 5;
+pub const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
 
 const _UFFDIO_COPY: u64 = 0x03;
 const _UFFDIO_WAKE: u64 = 0x02;

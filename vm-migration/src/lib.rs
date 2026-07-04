@@ -51,6 +51,20 @@ pub enum UffdError {
 
     #[error("Handler failed after startup")]
     HandlerFailed(#[source] std::io::Error),
+
+    #[error("Failed to connect to external UFFD handler socket")]
+    Connect(#[source] std::io::Error),
+
+    #[error("Failed to send UFFD handshake to external handler")]
+    SendHandshake(#[source] std::io::Error),
+
+    #[error("Failed to write-protect region at {addr:#x}+{len:#x}")]
+    WriteProtect {
+        addr: u64,
+        len: u64,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Error, Debug)]

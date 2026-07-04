@@ -130,10 +130,21 @@ pub(crate) fn create(required_features: u64) -> Result<OwnedFd, Error> {
 
 /// Register a memory range for missing-page fault handling.
 pub(crate) fn register(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<u64, Error> {
+    register_with_mode(fd, addr, len, userfaultfd::UFFDIO_REGISTER_MODE_MISSING)
+}
+
+/// Register a memory range with an explicit mode bitmask
+/// (`UFFDIO_REGISTER_MODE_MISSING` and/or `UFFDIO_REGISTER_MODE_WP`).
+pub(crate) fn register_with_mode(
+    fd: BorrowedFd<'_>,
+    addr: u64,
+    len: u64,
+    mode: u64,
+) -> Result<u64, Error> {
     let mut reg = UffdioRegister {
         range_start: addr,
         range_len: len,
-        mode: userfaultfd::UFFDIO_REGISTER_MODE_MISSING,
+        mode,
         ioctls: 0,
     };
     // SAFETY: `reg` is a valid, correctly-sized struct for this ioctl.
@@ -177,6 +188,36 @@ pub(crate) fn copy(fd: BorrowedFd<'_>, dst: u64, src: *const u8, len: u64) -> Re
 struct UffdioRange {
     start: u64,
     len: u64,
+}
+
+#[repr(C)]
+struct UffdioWriteprotect {
+    range: UffdioRange,
+    mode: u64,
+}
+
+/// Enable write-protection on a registered range.
+///
+/// Only effective on memory types with persistent WP state (hugetlbfs /
+/// shmem); for anonymous memory the WP bit is applied per-page by the
+/// fault handler via `UFFDIO_COPY_MODE_WP`.
+pub(crate) fn write_protect(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
+    let mut wp = UffdioWriteprotect {
+        range: UffdioRange { start: addr, len },
+        mode: userfaultfd::UFFDIO_WRITEPROTECT_MODE_WP,
+    };
+    // SAFETY: `wp` is a valid, correctly-sized struct for this ioctl.
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            userfaultfd::UFFDIO_WRITEPROTECT as libc::Ioctl,
+            &mut wp,
+        )
+    };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Wake threads waiting on a fault in the given range without copying data.

@@ -26,7 +26,8 @@ use vhost::vhost_kern::vhost_binding::{
 };
 
 use crate::userfaultfd::{
-    UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER, UFFDIO_WAKE, USERFAULTFD_IOC_NEW,
+    UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER, UFFDIO_WAKE, UFFDIO_WRITEPROTECT,
+    USERFAULTFD_IOC_NEW,
 };
 
 #[derive(Copy, Clone)]
@@ -424,6 +425,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_COPY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WRITEPROTECT)?],
         and![Cond::new(1, ArgLen::Dword, Eq, USERFAULTFD_IOC_NEW)?],
     ];
 
