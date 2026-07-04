@@ -84,7 +84,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
+use crate::config::{MemoryBackendConfig, MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -1356,6 +1356,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        memory_backend: Option<&MemoryBackendConfig>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1411,6 +1412,7 @@ impl Vm {
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode.unwrap_or_default(),
+                    memory_backend,
                     phys_bits,
                     &exit_evt,
                 )

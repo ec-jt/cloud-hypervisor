@@ -49,8 +49,9 @@ use vm_migration::{
     UffdError,
 };
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::config::MemoryRestoreMode;
+use crate::config::{MemoryBackendConfig, MemoryRestoreMode};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
@@ -292,6 +293,10 @@ pub struct MemoryManager {
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handler: Option<UffdHandler>,
+    // Keeps the userfaultfd alive when guest memory is demand-paged by an
+    // external handler process. If the fd were dropped, guest memory would
+    // silently revert to anonymous zero-page behavior.
+    external_uffd: Option<OwnedFd>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -1103,6 +1108,147 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// Restore guest memory via an external UFFD handler process.
+    ///
+    /// Unlike [`Self::restore_by_uffd`] (which spawns an internal handler
+    /// thread serving pages from the snapshot file), this delegates ALL page
+    /// faults to an external process: guest memory regions are registered
+    /// with a fresh userfaultfd in missing + write-protect mode, the memory
+    /// layout is sent as JSON over the handler's unix socket, and the
+    /// userfaultfd is passed via SCM_RIGHTS.
+    ///
+    /// The wire protocol matches Firecracker's UFFD `mem_backend` handshake
+    /// (a JSON array of `{base_host_virt_addr, size, offset, page_size}`
+    /// objects), so the same external handler binary works with both VMMs.
+    ///
+    /// Registration uses `UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP`
+    /// with `UFFD_FEATURE_WP_ASYNC`, allowing the handler to resolve read
+    /// faults with `UFFDIO_COPY_MODE_WP` for write-tracking (E2B pattern).
+    fn restore_by_external_uffd(
+        &mut self,
+        socket_path: &Path,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+
+        let guest_memory = self.guest_memory.memory();
+
+        // SAFETY: FFI call. Trivially safe.
+        let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+
+        if saved_regions
+            .regions()
+            .iter()
+            .any(|range| range.gpa % base_page_size != 0 || range.length % base_page_size != 0)
+        {
+            return Err(UffdError::UnalignedRanges.into());
+        }
+
+        // WP_ASYNC lets the kernel clear the WP bit on write faults without
+        // notifying the handler; EVENT_REMOVE covers madvise(MADV_REMOVE)
+        // from balloon devices. Both match Firecracker's UFFD restore path
+        // so external handlers observe identical semantics.
+        let required_features = crate::userfaultfd::UFFD_FEATURE_EVENT_REMOVE
+            | crate::userfaultfd::UFFD_FEATURE_WP_ASYNC
+            | self.required_uffd_features();
+
+        let uffd_fd = uffd::create(required_features).map_err(UffdError::Create)?;
+
+        #[derive(Serialize)]
+        struct UffdRegionMapping {
+            base_host_virt_addr: u64,
+            size: u64,
+            offset: u64,
+            page_size: u64,
+        }
+
+        let mut mappings: Vec<UffdRegionMapping> = Vec::new();
+        let mut file_offset: u64 = 0;
+
+        for range in saved_regions.regions() {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(range.gpa))
+                .map_err(|e| UffdError::GpaTranslation {
+                    gpa: range.gpa,
+                    source: e,
+                })? as u64;
+
+            let mode = crate::userfaultfd::UFFDIO_REGISTER_MODE_MISSING
+                | crate::userfaultfd::UFFDIO_REGISTER_MODE_WP;
+            let ioctls = uffd::register_with_mode(uffd_fd.as_fd(), host_addr, range.length, mode)
+                .map_err(|e| UffdError::Register {
+                    addr: host_addr,
+                    len: range.length,
+                    source: e,
+                })?;
+
+            if ioctls & crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+                != crate::userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
+            {
+                return Err(UffdError::MissingIoctlSupport {
+                    addr: host_addr,
+                    len: range.length,
+                }
+                .into());
+            }
+
+            let range_page_size = self
+                .memory_zones
+                .values()
+                .find_map(|zone| zone.backing_page_size_for_gpa(range.gpa))
+                .unwrap_or(base_page_size);
+
+            // Hugetlbfs-backed memory keeps a persistent WP state, so it can
+            // be write-protected upfront. Anonymous memory cannot: the WP
+            // bit is applied per-page by the handler via UFFDIO_COPY_MODE_WP.
+            if range_page_size > base_page_size {
+                uffd::write_protect(uffd_fd.as_fd(), host_addr, range.length).map_err(|e| {
+                    UffdError::WriteProtect {
+                        addr: host_addr,
+                        len: range.length,
+                        source: e,
+                    }
+                })?;
+            }
+
+            mappings.push(UffdRegionMapping {
+                base_host_virt_addr: host_addr,
+                size: range.length,
+                offset: file_offset,
+                page_size: range_page_size,
+            });
+
+            file_offset += range.length;
+        }
+
+        // This is safe to unwrap() because we control the mapping contents.
+        let handshake = serde_json::to_string(&mappings).unwrap();
+
+        let socket =
+            std::os::unix::net::UnixStream::connect(socket_path).map_err(UffdError::Connect)?;
+        socket
+            .send_with_fd(handshake.as_bytes(), uffd_fd.as_raw_fd())
+            .map_err(|e| {
+                UffdError::SendHandshake(io::Error::from_raw_os_error(e.errno()))
+            })?;
+
+        info!(
+            "External UFFD restore: sent {} region(s) ({} bytes total) to handler at {}",
+            mappings.len(),
+            file_offset,
+            socket_path.display()
+        );
+
+        // Keep our copy of the uffd alive for the lifetime of the VM. The
+        // handler process holds the serving copy; if it exits, faults block
+        // until the VM is torn down (no silent anon-memory fallback).
+        self.external_uffd = Some(uffd_fd);
+
+        Ok(())
+    }
+
     fn required_uffd_features(&self) -> u64 {
         let mut features = 0u64;
         if self.memory_zones.values().any(|z| z.shared && !z.hugepages) {
@@ -1880,6 +2026,7 @@ impl MemoryManager {
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
+            external_uffd: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
@@ -1901,6 +2048,7 @@ impl MemoryManager {
         source_url: Option<&str>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        memory_backend: Option<&MemoryBackendConfig>,
         phys_bits: u8,
         exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -1922,7 +2070,11 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            if memory_restore_mode == MemoryRestoreMode::OnDemand {
+            if let Some(backend) = memory_backend {
+                mm.lock()
+                    .unwrap()
+                    .restore_by_external_uffd(&backend.socket, &mem_snapshot.memory_ranges)?;
+            } else if memory_restore_mode == MemoryRestoreMode::OnDemand {
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
