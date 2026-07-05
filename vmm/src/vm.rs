@@ -3333,6 +3333,18 @@ impl Pausable for Vm {
     }
 }
 
+impl Vm {
+    /// dc-danus fork: make the next `Transportable::send()` skip the
+    /// memory-ranges write (vmstate-only snapshot). See
+    /// `MemoryManager::clear_snapshot_memory_ranges()`.
+    pub fn clear_snapshot_memory_ranges(&self) {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .clear_snapshot_memory_ranges();
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct VmSnapshot {
     #[cfg(target_arch = "x86_64")]

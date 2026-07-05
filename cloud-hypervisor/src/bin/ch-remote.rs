@@ -912,6 +912,7 @@ fn add_vsock_config(config: &str) -> Result<String, Error> {
 fn snapshot_config(url: &str) -> String {
     let snapshot_config = vmm::api::VmSnapshotConfig {
         destination_url: String::from(url),
+        skip_memory: false,
     };
 
     serde_json::to_string(&snapshot_config).unwrap()

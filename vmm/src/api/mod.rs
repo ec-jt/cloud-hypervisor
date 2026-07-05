@@ -276,6 +276,14 @@ pub struct VmRemoveDeviceData {
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+    /// Skip writing the memory-ranges file (vmstate-only snapshot).
+    ///
+    /// dc-danus fork extension: turn checkpoints export memory via the
+    /// dirty-delta-packed endpoint instead, so writing the full guest
+    /// memory image inside the pause window is wasted freeze time.
+    /// Defaults to false (standard full snapshot).
+    #[serde(default)]
+    pub skip_memory: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -532,7 +540,7 @@ pub trait RequestHandler {
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_snapshot(&mut self, destination_url: &str, skip_memory: bool) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1661,7 +1669,7 @@ impl ApiAction for VmSnapshot {
             info!("API request event: VmSnapshot {config:?}");
 
             let response = vmm
-                .vm_snapshot(&config.destination_url)
+                .vm_snapshot(&config.destination_url, config.skip_memory)
                 .map_err(ApiError::VmSnapshot)
                 .map(|_| ApiResponsePayload::Empty);
 

@@ -1941,13 +1941,26 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(
+        &mut self,
+        destination_url: &str,
+        skip_memory: bool,
+    ) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             // Drain console_info so that FDs are not reused
             let _ = self.console_info.take();
             vm.snapshot()
                 .map_err(VmError::Snapshot)
                 .and_then(|snapshot| {
+                    // dc-danus fork: vmstate-only snapshot. Clearing the
+                    // pending memory range table AFTER vm.snapshot() (so
+                    // state.json keeps its memory metadata) makes
+                    // MemoryManager::send() a no-op — the full guest
+                    // memory image is never written. Memory is exported
+                    // separately via /memory/dirty-delta-packed.
+                    if skip_memory {
+                        vm.clear_snapshot_memory_ranges();
+                    }
                     vm.send(&snapshot, destination_url)
                         .map_err(VmError::SnapshotSend)
                 })

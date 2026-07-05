@@ -2868,6 +2868,14 @@ impl MemoryManager {
         Ok(table)
     }
 
+    /// dc-danus fork: drop the pending snapshot memory range table so the
+    /// following `Transportable::send()` skips writing the memory-ranges
+    /// file (vmstate-only snapshot). Must be called AFTER `snapshot()`
+    /// (state.json data is already serialized by then) and BEFORE `send()`.
+    pub fn clear_snapshot_memory_ranges(&mut self) {
+        self.snapshot_memory_ranges = MemoryRangeTable::default();
+    }
+
     pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
         MemoryManagerSnapshotData {
             memory_ranges: self.snapshot_memory_ranges.clone(),
