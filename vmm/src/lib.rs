@@ -2550,7 +2550,11 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_init_delta_hashes(&mut self, golden_mem_path: String) -> result::Result<(), VmError> {
+    fn vm_init_delta_hashes(
+        &mut self,
+        golden_mem_path: String,
+        refresh_bitmap_path: Option<String>,
+    ) -> result::Result<(), VmError> {
         let Some(ref vm) = self.vm else {
             return Err(VmError::VmNotRunning);
         };
@@ -2558,6 +2562,20 @@ impl RequestHandler for Vmm {
         self.delta_tracker
             .init_delta_hashes(&golden_mem_path)
             .map_err(VmError::DirtyDelta)?;
+
+        // Version-restore path: guest memory is golden + injected
+        // session blocks, so hashes for the injected blocks must be
+        // computed from LIVE guest memory or reverts-to-golden of those
+        // blocks are skipped from exports (chain restore corruption).
+        // Reads demand-fault through the external UFFD handler; called
+        // before vm.resume.
+        if let Some(bitmap_path) = refresh_bitmap_path {
+            let guest_memory = vm.guest_memory();
+            let mem = guest_memory.memory();
+            self.delta_tracker
+                .rehash_from_guest_bitmap(&*mem, &bitmap_path)
+                .map_err(VmError::DirtyDelta)?;
+        }
 
         // Start hypervisor dirty page logging so that subsequent
         // dirty-delta exports see all guest writes from this point on.

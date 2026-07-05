@@ -257,6 +257,19 @@ pub struct VmResizeZoneData {
 pub struct VmInitDeltaHashesData {
     /// Path to the golden memory snapshot file to hash and keep mmap'd.
     pub golden_mem_path: String,
+    /// Optional bitmap file (1 bit per 4KB block, LSB-first) of blocks
+    /// whose hashes must be refreshed from CURRENT guest memory after
+    /// the golden init.  Required after a version restore: guest memory
+    /// is golden + injected session blocks, so hashing only the golden
+    /// file leaves stale hashes for the injected blocks - a later guest
+    /// write reverting such a block to golden content hashes equal to
+    /// the stored value and is skipped from exports, and the restore
+    /// chain then layers the stale injected value under a vmstate that
+    /// expects golden content (guest page-allocator list corruption).
+    /// Reads demand-fault through UFFD; call while the external handler
+    /// is serving (post vm.restore, pre vm.resume).
+    #[serde(default)]
+    pub refresh_bitmap_path: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -612,7 +625,11 @@ pub trait RequestHandler {
 
     fn vm_nmi(&mut self) -> Result<(), VmError>;
 
-    fn vm_init_delta_hashes(&mut self, golden_mem_path: String) -> Result<(), VmError>;
+    fn vm_init_delta_hashes(
+        &mut self,
+        golden_mem_path: String,
+        refresh_bitmap_path: Option<String>,
+    ) -> Result<(), VmError>;
 
     fn vm_dirty_delta(&mut self) -> Result<Option<Vec<u8>>, VmError>;
 
@@ -1771,7 +1788,7 @@ impl ApiAction for VmInitDeltaHashes {
             info!("API request event: VmInitDeltaHashes {data:?}");
 
             let response = vmm
-                .vm_init_delta_hashes(data.golden_mem_path)
+                .vm_init_delta_hashes(data.golden_mem_path, data.refresh_bitmap_path)
                 .map_err(ApiError::VmDirtyDelta)
                 .map(|_| ApiResponsePayload::Empty);
 

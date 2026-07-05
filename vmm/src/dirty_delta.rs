@@ -124,6 +124,77 @@ impl DeltaTracker {
         n
     }
 
+    /// Re-compute stored hashes from CURRENT guest memory for the
+    /// blocks marked in a bitmap file (1 bit per 4KB block, LSB-first
+    /// within each byte — same layout as the sparse-overlay `.bitmap`
+    /// companion the Python restore path writes).
+    ///
+    /// Used after a version restore where guest memory is golden +
+    /// injected session blocks: hashes computed from the golden FILE
+    /// would be stale for the injected blocks, so a later guest write
+    /// that reverts an injected block to exact golden content would
+    /// hash equal to the stored value and be silently skipped from
+    /// exports. The restore chain then layers the stale injected
+    /// content under a vmstate that expects golden content (observed as
+    /// guest page-allocator list corruption after resume).
+    ///
+    /// Reads demand-fault through UFFD — call while the external
+    /// handler is serving (post vm.restore, pre vm.resume). Only the
+    /// marked blocks (KB-to-MB scale) are touched, so guest RSS stays
+    /// demand-paged.
+    ///
+    /// Requires `init_delta_hashes()` first (golden mmap + hash count).
+    pub fn rehash_from_guest_bitmap<M: GuestMemory>(
+        &mut self,
+        mem: &M,
+        bitmap_path: &str,
+    ) -> Result<usize, String> {
+        use xxhash_rust::xxh3::xxh3_64;
+
+        if self.delta_hashes.is_empty() {
+            return Err(
+                "delta_hashes not initialized - call init_delta_hashes first".to_string()
+            );
+        }
+
+        let bitmap = std::fs::read(bitmap_path)
+            .map_err(|e| format!("read refresh bitmap {bitmap_path}: {e}"))?;
+
+        let num_blocks = self.delta_hashes.len();
+        let mut rehashed = 0usize;
+        for (byte_idx, byte) in bitmap.iter().enumerate() {
+            if *byte == 0 {
+                continue;
+            }
+            for bit in 0..8 {
+                if byte & (1 << bit) == 0 {
+                    continue;
+                }
+                let block_idx = byte_idx * 8 + bit;
+                if block_idx >= num_blocks {
+                    continue;
+                }
+                let gpa = (block_idx * BLOCK_SIZE) as u64;
+                let Ok(host) = mem.get_host_address(GuestAddress(gpa)) else {
+                    continue;
+                };
+                // SAFETY: host points to a valid mapped guest page
+                // (fault serviced by the UFFD handler on first access);
+                // the VM is paused so the content is stable.
+                let block =
+                    unsafe { std::slice::from_raw_parts(host as *const u8, BLOCK_SIZE) };
+                self.delta_hashes[block_idx] = xxh3_64(block);
+                rehashed += 1;
+            }
+        }
+
+        info!(
+            "rehash_from_guest_bitmap: refreshed {rehashed} hashes from live guest memory \
+             ({bitmap_path})"
+        );
+        Ok(rehashed)
+    }
+
     /// Initialize xxh3 delta hashes from the golden memory file.
     ///
     /// Mmaps the golden file read-only, computes xxh3_64 for each 4KB
