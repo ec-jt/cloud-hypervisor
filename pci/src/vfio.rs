@@ -15,7 +15,7 @@ use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
 use hypervisor::HypervisorVmError;
 use libc::{_SC_PAGESIZE, sysconf};
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vfio_bindings::bindings::vfio::*;
@@ -792,14 +792,27 @@ impl VfioCommon {
                 .set_region_type(region_type)
                 .set_prefetchable(prefetchable);
 
-            if bar_id == VFIO_PCI_ROM_REGION_INDEX {
-                self.configuration
-                    .add_pci_rom_bar(&bar, flags & 0x1)
-                    .map_err(|e| PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e))?;
-            } else {
-                self.configuration
-                    .add_pci_bar(&bar)
-                    .map_err(|e| PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e))?;
+            // The creation of the PCI BAR must happen only during the
+            // creation of a brand new VM. When a VM is restored from a
+            // snapshot, the PciConfiguration was reconstructed from the
+            // saved PciConfigurationState with the BARs already marked
+            // used — calling add_pci_bar again fails with BarInUse.
+            // This mirrors the virtio-pci transport's `!restoring`
+            // guard (virtio-devices/src/transport/pci_device.rs).
+            if resources.is_none() {
+                if bar_id == VFIO_PCI_ROM_REGION_INDEX {
+                    self.configuration
+                        .add_pci_rom_bar(&bar, flags & 0x1)
+                        .map_err(|e| {
+                            PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e)
+                        })?;
+                } else {
+                    self.configuration
+                        .add_pci_bar(&bar)
+                        .map_err(|e| {
+                            PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e)
+                        })?;
+                }
             }
 
             bars.push(bar);
@@ -1169,7 +1182,14 @@ impl VfioCommon {
                 enabled: false,
             });
 
-            self.enable_intx()?;
+            // Non-fatal: re-adding a device whose guest driver is
+            // GSP_SR-suspended can fail INTx enable (DisINTx state left
+            // by the suspended driver). Modern GPUs use MSI-X — losing
+            // INTx must not abort the whole device add.
+            if let Err(e) = self.enable_intx() {
+                warn!("Could not enable INTx (continuing without): {e}");
+                self.interrupt.intx = None;
+            }
         }
 
         Ok(())
