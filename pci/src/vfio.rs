@@ -384,6 +384,11 @@ pub(crate) trait Vfio: Send + Sync {
         u32::from_le_bytes(data)
     }
 
+    fn write_config_word(&self, offset: u32, buf: u16) {
+        let data: [u8; 2] = buf.to_le_bytes();
+        self.write_config(offset, &data);
+    }
+
     fn write_config_dword(&self, offset: u32, buf: u32) {
         let data: [u8; 4] = buf.to_le_bytes();
         self.write_config(offset, &data);
@@ -485,6 +490,17 @@ struct VfioCommonState {
     intx_state: Option<IntxState>,
     msi_state: Option<MsiState>,
     msix_state: Option<MsixState>,
+    // Physical PCI COMMAND register at snapshot time. Restored in
+    // set_state(): the vfio fd open in the restoring process runs
+    // pci_clear_master() (vfio_pci_core_enable), so Bus Master Enable
+    // is OFF and nothing else re-arms it — guest COMMAND writes pass
+    // through live and are not otherwise captured by the snapshot.
+    // Without BME, a GSP_SR-suspended NVIDIA driver cannot resume:
+    // the FSP must DMA-read the COT sysmem buffers and rejects the
+    // resume boot with a generic command error.
+    // Optional for backward compat with older snapshots.
+    #[serde(default)]
+    command_reg: Option<u16>,
 }
 
 pub(crate) struct ConfigPatch {
@@ -1429,6 +1445,7 @@ impl VfioCommon {
             intx_state,
             msi_state,
             msix_state,
+            command_reg: Some(self.vfio_wrapper.read_config_word(PCI_COMMAND_OFFSET)),
         }
     }
 
@@ -1457,6 +1474,25 @@ impl VfioCommon {
 
         if let Some(msix) = &state.msix_state {
             self.initialize_msix(msix.cap, msix.cap_offset, msix.bdf.into(), msix_state);
+        }
+
+        // Replay the physical COMMAND register saved at snapshot time.
+        // The vfio device fd open in THIS process already ran
+        // pci_clear_master() (vfio_pci_core_enable in the host kernel),
+        // clearing Bus Master Enable on the physical function. The
+        // guest believes BME is still set (its config writes passed
+        // through live pre-snapshot), so nothing re-arms it on resume.
+        // A GSP_SR-suspended NVIDIA driver then fails its resume boot:
+        // the FSP DMA-reads the COT sysmem buffers and returns a
+        // generic command error when bus mastering is off.
+        if let Some(cmd) = state.command_reg {
+            let cur = self.vfio_wrapper.read_config_word(PCI_COMMAND_OFFSET);
+            if cur != cmd {
+                info!(
+                    "Restoring physical PCI COMMAND register: {cur:#06x} -> {cmd:#06x}"
+                );
+                self.vfio_wrapper.write_config_word(PCI_COMMAND_OFFSET, cmd);
+            }
         }
 
         Ok(())
@@ -1914,6 +1950,7 @@ impl BusDevice for VfioPciDevice {
 }
 
 // Offset of the 16-bit status register in the PCI configuration space.
+const PCI_COMMAND_OFFSET: u32 = 0x04;
 const PCI_CONFIG_STATUS_OFFSET: u32 = 0x06;
 // Status bit indicating the presence of a capabilities list.
 const PCI_CONFIG_STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
