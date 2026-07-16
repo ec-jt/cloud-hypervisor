@@ -1733,6 +1733,13 @@ impl VfioPciDevice {
             }
 
             let region_flags = self.device.get_region_flags(region.index);
+            info!(
+                "[VFIO_BAR_TRACE] bdf={} bar={} guest=0x{:x} len=0x{:x} flags=0x{:x} excluded={} p2p={} iommu_attached={}",
+                self.bdf, region.index, region.start.0, region.length,
+                region_flags,
+                self.common.x_exclude_mmap_bars.contains(&(region.index as u8)),
+                self.p2p_dma, self.iommu_attached,
+            );
             if region_flags & VFIO_REGION_INFO_FLAG_MMAP != 0 {
                 let mut prot = 0;
                 if region_flags & VFIO_REGION_INFO_FLAG_READ != 0 {
@@ -1772,6 +1779,7 @@ impl VfioPciDevice {
 
                 let page_size = get_page_size();
                 for area in sparse_areas.iter() {
+                    let area_started = std::time::Instant::now();
                     // KVM_SET_USER_MEMORY_REGION requires memory_size to be a
                     // multiple of the host page size. On aarch64 with 64K pages
                     // a device BAR can be smaller than a page (e.g. 16K NVMe
@@ -1820,6 +1828,11 @@ impl VfioPciDevice {
                             return Err(VfioPciError::MmapArea);
                         }
                     };
+                    info!(
+                        "[VFIO_BAR_TRACE] bdf={} bar={} host-mmap offset=0x{:x} len=0x{:x} elapsed_us={}",
+                        self.bdf, region.index, area.offset, mmap_len,
+                        area_started.elapsed().as_micros(),
+                    );
 
                     let user_memory_region = UserMemoryRegion {
                         slot: self.memory_slot_allocator.next_memory_slot(),
@@ -1830,6 +1843,7 @@ impl VfioPciDevice {
                     // user_memory_region.mapping.addr() points to
                     // user_memory_region.mapping.len() bytes of
                     // valid memory that will only be unmapped with munmap().
+                    let kvm_started = std::time::Instant::now();
                     unsafe {
                         self.vm.create_user_memory_region(
                             user_memory_region.slot,
@@ -1841,10 +1855,17 @@ impl VfioPciDevice {
                         )
                     }
                     .map_err(VfioPciError::CreateUserMemoryRegion)?;
+                    info!(
+                        "[VFIO_BAR_TRACE] bdf={} bar={} kvm-slot={} guest=0x{:x} len=0x{:x} elapsed_us={}",
+                        self.bdf, region.index, user_memory_region.slot,
+                        user_memory_region.start, user_memory_region.mapping.len(),
+                        kvm_started.elapsed().as_micros(),
+                    );
 
                     // Map the MMIO BAR into the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
                     if !self.iommu_attached && self.p2p_dma {
+                        let dma_started = std::time::Instant::now();
                         // vfio_dma_map should be unsafe but isn't.
                         #[allow(unused_unsafe)]
                         // SAFETY: MmapRegion invariants guarantee that
@@ -1859,6 +1880,11 @@ impl VfioPciDevice {
                             )
                         }
                         .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))?;
+                        info!(
+                            "[VFIO_BAR_TRACE] bdf={} bar={} dma-map iova=0x{:x} len=0x{:x} elapsed_us={}",
+                            self.bdf, region.index, user_memory_region.start,
+                            user_memory_region.mapping.len(), dma_started.elapsed().as_micros(),
+                        );
                     }
                     region.user_memory_regions.push(user_memory_region);
                 }
@@ -2027,6 +2053,10 @@ impl PciDevice for VfioPciDevice {
     }
 
     fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), io::Error> {
+        info!(
+            "[VFIO_BAR_TRACE] bdf={} move old=0x{:x} new=0x{:x}",
+            self.bdf, old_base, new_base,
+        );
         for region in self.common.mmio_regions.iter_mut() {
             if region.start.raw_value() == old_base {
                 region.start = GuestAddress(new_base);

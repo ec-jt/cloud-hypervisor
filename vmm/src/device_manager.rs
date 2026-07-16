@@ -725,6 +725,10 @@ impl DeviceRelocation for AddressManager {
         pci_dev: &mut dyn PciDevice,
         region_type: PciBarRegionType,
     ) -> std::result::Result<(), std::io::Error> {
+        info!(
+            "[VFIO_BAR_TRACE] device-manager move old=0x{:x} new=0x{:x} len=0x{:x} type={:?} device={:?}",
+            old_base, new_base, len, region_type, pci_dev.id(),
+        );
         match region_type {
             PciBarRegionType::IoRegion => {
                 let mut sys_allocator = self.allocator.lock().unwrap();
@@ -911,6 +915,15 @@ impl DeviceRelocation for AddressManager {
             region.start.raw_value() == old_base && region.length == len
         }) {
             region.start = GuestAddress(new_base);
+            info!(
+                "[VFIO_BAR_TRACE] shared-region move old=0x{:x} new=0x{:x} len=0x{:x}",
+                old_base, new_base, len,
+            );
+        } else {
+            warn!(
+                "[VFIO_BAR_TRACE] shared-region NOT FOUND old=0x{:x} len=0x{:x}",
+                old_base, len,
+            );
         }
 
         Ok(())
