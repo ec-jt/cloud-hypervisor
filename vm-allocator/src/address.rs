@@ -42,6 +42,35 @@ pub struct AddressAllocator {
 }
 
 impl AddressAllocator {
+    /// Allocate from the lowest suitable address instead of the default
+    /// highest-address-first policy.
+    pub fn allocate_low(
+        &mut self,
+        address: Option<GuestAddress>,
+        size: GuestUsize,
+        align_size: Option<GuestUsize>,
+    ) -> Option<GuestAddress> {
+        if address.is_some() {
+            return self.allocate(address, size, align_size);
+        }
+        let alignment = align_size.unwrap_or(4);
+        if size == 0 || !alignment.is_power_of_two() {
+            return None;
+        }
+        let mut candidate = self.align_address(self.base, alignment);
+        for (range_start, range_size) in self.ranges.iter() {
+            if candidate.checked_add(size)? <= *range_start {
+                self.ranges.insert(candidate, size);
+                return Some(candidate);
+            }
+            let range_end = range_start.checked_add(*range_size)?;
+            if range_end > candidate {
+                candidate = self.align_address(range_end, alignment);
+            }
+        }
+        None
+    }
+
     /// Creates a new `AddressAllocator` for managing a range of addresses.
     /// Can return `None` if `base` + `size` overflows a u64.
     ///

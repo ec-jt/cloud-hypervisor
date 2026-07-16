@@ -787,7 +787,7 @@ impl VfioCommon {
                     // aligned.
                     region_size = self.fixup_msix_region(bar_id, region_size);
                     mmio64_allocator
-                        .allocate(
+                        .allocate_low(
                             restored_bar_addr,
                             region_size,
                             Some(std::cmp::max(

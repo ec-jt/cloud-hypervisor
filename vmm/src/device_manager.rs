@@ -713,6 +713,7 @@ pub(crate) struct AddressManager {
     device_tree: Arc<Mutex<DeviceTree>>,
     pci_mmio32_allocators: Box<[Arc<Mutex<AddressAllocator>>]>,
     pci_mmio64_allocators: Box<[Arc<Mutex<AddressAllocator>>]>,
+    mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
 }
 
 impl DeviceRelocation for AddressManager {
@@ -898,7 +899,21 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        pci_dev.move_bar(old_base, new_base)
+        pci_dev.move_bar(old_base, new_base)?;
+
+        // VfioDmaMapping uses this shared region table to translate DMA
+        // ranges.  VFIO devices keep their own MmioRegion copies, so moving
+        // only the device-local BAR left this table at the pre-hotplug GPA.
+        // Linux reallocates large GPU BARs during ACPI hotplug; stale entries
+        // then make GB202 BAR2/BAR0-window DMA resolve against the old range.
+        let mut regions = self.mmio_regions.lock().unwrap();
+        if let Some(region) = regions.iter_mut().find(|region| {
+            region.start.raw_value() == old_base && region.length == len
+        }) {
+            region.start = GuestAddress(new_base);
+        }
+
+        Ok(())
     }
 }
 
@@ -1277,6 +1292,7 @@ impl DeviceManager {
             4 << 30,
         );
 
+        let mmio_regions = Arc::new(Mutex::new(Vec::new()));
         let address_manager = Arc::new(AddressManager {
             allocator: memory_manager.lock().unwrap().allocator(),
             io_bus,
@@ -1285,6 +1301,7 @@ impl DeviceManager {
             device_tree: Arc::clone(&device_tree),
             pci_mmio32_allocators,
             pci_mmio64_allocators,
+            mmio_regions: Arc::clone(&mmio_regions),
         });
 
         // First we create the MSI interrupt manager, the legacy one is created
@@ -1432,7 +1449,7 @@ impl DeviceManager {
             pending_activations: Arc::new(Mutex::new(Vec::default())),
             acpi_platform_addresses: AcpiPlatformAddresses::default(),
             rate_limit_groups,
-            mmio_regions: Arc::new(Mutex::new(Vec::new())),
+            mmio_regions,
             #[cfg(feature = "fw_cfg")]
             fw_cfg: None,
             #[cfg(feature = "ivshmem")]
